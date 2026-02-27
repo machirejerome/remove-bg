@@ -229,23 +229,27 @@ def order_corners(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
-def perspective_correct(image: Image.Image, mask_image: Image.Image,
-                        padding: int = 5) -> tuple:
+def perspective_correct(original_image: Image.Image, mask_image: Image.Image,
+                        padding: int = 5, background: str = "Alpha",
+                        background_color: str = "#222222") -> Image.Image:
     """
-    Straighten a rectangular postcard using its mask.
+    Straighten a rectangular postcard and output it as a clean rectangle.
     
-    1. Find the largest contour in the mask
-    2. Approximate to a 4-corner polygon
-    3. Apply perspective transform to get a perfect rectangle
+    Works on the ORIGINAL image (before background removal):
+    1. Find 4 corners of the postcard from the mask
+    2. Warp the original image to a straight rectangle
+    3. Apply alpha/background to the straightened result
+    4. Output = clean, straight postcard (no extra crop needed)
     
     Args:
-        image: Full-size result image (RGBA or RGB)
-        mask_image: Grayscale mask (L mode)
-        padding: Extra pixels around the postcard to avoid cutting edges
+        original_image: Original RGB image (before masking)
+        mask_image: Grayscale mask from SAM3 (L mode)
+        padding: Extra pixels to avoid cutting edges
+        background: "Alpha" or "Color"
+        background_color: Hex color for Color mode
     
     Returns:
-        (corrected_image, corrected_mask) or (original_image, original_mask)
-        if correction fails
+        Straightened postcard image, or None if correction fails.
     """
     mask_np = np.array(mask_image)
     
@@ -253,16 +257,14 @@ def perspective_correct(image: Image.Image, mask_image: Image.Image,
     contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         logger.warning("Perspective: no contours found")
-        return image, mask_image
+        return None
     
-    # Take largest contour by area
+    # Take largest contour
     contour = max(contours, key=cv2.contourArea)
     
-    # Approximate polygon — try to get 4 corners
+    # Try to approximate to 4 corners
     peri = cv2.arcLength(contour, True)
     approx = None
-    
-    # Try different epsilon values to find exactly 4 corners
     for eps_mult in [0.02, 0.03, 0.04, 0.05, 0.01]:
         candidate = cv2.approxPolyDP(contour, eps_mult * peri, True)
         if len(candidate) == 4:
@@ -270,28 +272,24 @@ def perspective_correct(image: Image.Image, mask_image: Image.Image,
             break
     
     if approx is None or len(approx) != 4:
-        # Fallback: use the minimum area rotated rectangle
         rect = cv2.minAreaRect(contour)
         box = cv2.boxPoints(rect)
         approx = box.reshape(4, 1, 2).astype(np.float32)
         logger.info("Perspective: using minAreaRect fallback")
     
-    # Get the 4 source corners, ordered consistently
-    src_pts = approx.reshape(4, 2).astype(np.float32)
-    src_pts = order_corners(src_pts)
+    # Order corners: TL, TR, BR, BL
+    src_pts = order_corners(approx.reshape(4, 2).astype(np.float32))
     
-    # Calculate target dimensions from the source corners
-    # Width: max of top edge and bottom edge
+    # Target dimensions
     width_top = np.linalg.norm(src_pts[1] - src_pts[0])
     width_bot = np.linalg.norm(src_pts[2] - src_pts[3])
     target_w = int(max(width_top, width_bot)) + 2 * padding
     
-    # Height: max of left edge and right edge
     height_left = np.linalg.norm(src_pts[3] - src_pts[0])
     height_right = np.linalg.norm(src_pts[2] - src_pts[1])
     target_h = int(max(height_left, height_right)) + 2 * padding
     
-    # Target rectangle with padding
+    # Destination rectangle
     dst_pts = np.array([
         [padding, padding],
         [target_w - padding - 1, padding],
@@ -299,28 +297,16 @@ def perspective_correct(image: Image.Image, mask_image: Image.Image,
         [padding, target_h - padding - 1],
     ], dtype=np.float32)
     
-    # Compute perspective transform
     matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
     
-    # Warp the image
-    img_np = np.array(image)
-    if image.mode == "RGBA":
-        # Warp with transparent background
-        warped = cv2.warpPerspective(
-            img_np, matrix, (target_w, target_h),
-            flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0, 0),
-        )
-        corrected_image = Image.fromarray(warped, "RGBA")
-    else:
-        warped = cv2.warpPerspective(
-            img_np, matrix, (target_w, target_h),
-            flags=cv2.INTER_LANCZOS4,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
-        corrected_image = Image.fromarray(warped, "RGB")
+    # Warp the ORIGINAL image (RGB) — this straightens the postcard
+    orig_np = np.array(original_image)
+    warped_img = cv2.warpPerspective(
+        orig_np, matrix, (target_w, target_h),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(0, 0, 0),
+    )
     
     # Warp the mask too
     warped_mask = cv2.warpPerspective(
@@ -329,13 +315,20 @@ def perspective_correct(image: Image.Image, mask_image: Image.Image,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    corrected_mask = Image.fromarray(warped_mask, "L")
     
-    logger.info(
-        "Perspective corrected: %dx%d → %dx%d",
-        image.width, image.height, target_w, target_h,
-    )
-    return corrected_image, corrected_mask
+    # Apply background to the straightened image
+    straight_img = Image.fromarray(warped_img, "RGB")
+    straight_mask = Image.fromarray(warped_mask, "L")
+    result = apply_background_color(straight_img, straight_mask, background, background_color)
+    
+    if background == "Alpha":
+        result = result.convert("RGBA")
+    else:
+        result = result.convert("RGB")
+    
+    logger.info("Perspective corrected: %dx%d → %dx%d", 
+                original_image.width, original_image.height, target_w, target_h)
+    return result
 
 
 def run_sam3_segmentation(
@@ -527,18 +520,25 @@ def handler(job: dict) -> dict:
                 "error": f"SAM3 found no objects for prompt: '{prompt}'",
             }
 
-        # --- Step 5b: Perspective correction (optional) ---
+        # --- Step 5b: Perspective correction OR simple crop ---
         perspective_applied = False
         if do_perspective:
-            result_image, mask_image = perspective_correct(
-                result_image, mask_image, padding=bbox_padding,
+            corrected = perspective_correct(
+                image, mask_image, padding=bbox_padding,
+                background=background, background_color=bg_color,
             )
-            perspective_applied = True
-
-        # --- Step 6: Crop to bounding box ---
-        crop_bbox = compute_bounding_box(mask_image, padding=bbox_padding)
-        result_image = result_image.crop(crop_bbox)
-        logger.info("Cropped: %dx%d", result_image.width, result_image.height)
+            if corrected is not None:
+                result_image = corrected
+                perspective_applied = True
+            else:
+                # Fallback to normal crop
+                crop_bbox = compute_bounding_box(mask_image, padding=bbox_padding)
+                result_image = result_image.crop(crop_bbox)
+        else:
+            # --- Step 6: Normal crop to bounding box ---
+            crop_bbox = compute_bounding_box(mask_image, padding=bbox_padding)
+            result_image = result_image.crop(crop_bbox)
+        logger.info("Output: %dx%d (perspective=%s)", result_image.width, result_image.height, perspective_applied)
 
         # --- Step 7: Encode ---
         result_base64 = image_to_base64(result_image)
