@@ -1,0 +1,29 @@
+# Test outputs
+test_output.png
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Docker
+sam3_lib/
+sam3_models/
+
+# ComfyUI workflow (original reference only)
+*.json
