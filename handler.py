@@ -253,32 +253,26 @@ def perspective_correct(original_image: Image.Image, mask_image: Image.Image,
     """
     mask_np = np.array(mask_image)
     
-    # Find contours
+    # Find ALL contours and merge them
     contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         logger.warning("Perspective: no contours found")
         return None
     
-    # Take largest contour
-    contour = max(contours, key=cv2.contourArea)
+    # Merge all contour points into one set (handles multi-instance masks)
+    all_points = np.vstack(contours)
     
-    # Try to approximate to 4 corners
-    peri = cv2.arcLength(contour, True)
-    approx = None
-    for eps_mult in [0.02, 0.03, 0.04, 0.05, 0.01]:
-        candidate = cv2.approxPolyDP(contour, eps_mult * peri, True)
-        if len(candidate) == 4:
-            approx = candidate
-            break
+    # Convex hull → gives the outer boundary of the entire postcard
+    hull = cv2.convexHull(all_points)
     
-    if approx is None or len(approx) != 4:
-        rect = cv2.minAreaRect(contour)
-        box = cv2.boxPoints(rect)
-        approx = box.reshape(4, 1, 2).astype(np.float32)
-        logger.info("Perspective: using minAreaRect fallback")
+    # Use minAreaRect on the hull → reliable rotated rectangle
+    rect = cv2.minAreaRect(hull)
+    src_pts = cv2.boxPoints(rect).astype(np.float32)
+    logger.info("Perspective: minAreaRect angle=%.1f, size=%.0fx%.0f", 
+                rect[2], rect[1][0], rect[1][1])
     
     # Order corners: TL, TR, BR, BL
-    src_pts = order_corners(approx.reshape(4, 2).astype(np.float32))
+    src_pts = order_corners(src_pts)
     
     # Target dimensions
     width_top = np.linalg.norm(src_pts[1] - src_pts[0])
