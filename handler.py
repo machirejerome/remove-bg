@@ -35,7 +35,9 @@ import sys
 import time
 
 import numpy as np
+import cv2
 import torch
+from contextlib import nullcontext
 from PIL import Image, ImageFilter, ExifTags
 
 # ---------------------------------------------------------------------------
