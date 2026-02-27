@@ -36,10 +36,7 @@ RUN git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG.git /tmp/comfyui
 # ─── SAM3 Model Checkpoint ─────────────────────────────────────────────────
 # Download sam3.pt from public 1038lab/sam3 mirror (no access request needed)
 RUN mkdir -p /app/sam3_models && \
-    python -c "\
-    from huggingface_hub import hf_hub_download; \
-    path = hf_hub_download(repo_id='1038lab/sam3', filename='sam3.pt', local_dir='/app/sam3_models'); \
-    print(f'Downloaded SAM3 checkpoint: {path}')"
+    python -c "from huggingface_hub import hf_hub_download; path = hf_hub_download(repo_id='1038lab/sam3', filename='sam3.pt', local_dir='/app/sam3_models'); print(f'Downloaded SAM3 checkpoint: {path}')"
 
 # Copy handler
 COPY handler.py .
