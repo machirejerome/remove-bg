@@ -26,8 +26,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # SAM3 Python library (code only, ~34MB — NOT the model)
 RUN git clone --depth 1 https://github.com/1038lab/ComfyUI-RMBG.git /tmp/comfyui-rmbg && \
-    mkdir -p /app/sam3_lib && \
-    cp -r /tmp/comfyui-rmbg/models/sam3/* /app/sam3_lib/ && \
+    mkdir -p /app/sam3_lib/sam3 && \
+    cp -r /tmp/comfyui-rmbg/models/sam3/* /app/sam3_lib/sam3/ && \
     rm -rf /tmp/comfyui-rmbg
 
 # Copy handler + startup script
@@ -37,7 +37,7 @@ RUN chmod +x start.sh
 
 # Environment
 ENV SAM3_LIB_DIR=/app/sam3_lib
-ENV SAM3_BPE_PATH=/app/sam3_lib/assets/bpe_simple_vocab_16e6.txt.gz
+ENV SAM3_BPE_PATH=/app/sam3_lib/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 ENV SAM3_MODEL_DIR=/runpod-volume/sam3_models
 
 # Start: downloads model if needed, then runs handler
