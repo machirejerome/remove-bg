@@ -215,6 +215,129 @@ def image_to_base64(image: Image.Image, fmt: str = "PNG") -> str:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
+def order_corners(pts: np.ndarray) -> np.ndarray:
+    """
+    Order 4 points as: top-left, top-right, bottom-right, bottom-left.
+    """
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left: smallest x+y
+    rect[2] = pts[np.argmax(s)]   # bottom-right: largest x+y
+    d = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(d)]   # top-right: smallest x-y
+    rect[3] = pts[np.argmax(d)]   # bottom-left: largest x-y
+    return rect
+
+
+def perspective_correct(image: Image.Image, mask_image: Image.Image,
+                        padding: int = 5) -> tuple:
+    """
+    Straighten a rectangular postcard using its mask.
+    
+    1. Find the largest contour in the mask
+    2. Approximate to a 4-corner polygon
+    3. Apply perspective transform to get a perfect rectangle
+    
+    Args:
+        image: Full-size result image (RGBA or RGB)
+        mask_image: Grayscale mask (L mode)
+        padding: Extra pixels around the postcard to avoid cutting edges
+    
+    Returns:
+        (corrected_image, corrected_mask) or (original_image, original_mask)
+        if correction fails
+    """
+    mask_np = np.array(mask_image)
+    
+    # Find contours
+    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        logger.warning("Perspective: no contours found")
+        return image, mask_image
+    
+    # Take largest contour by area
+    contour = max(contours, key=cv2.contourArea)
+    
+    # Approximate polygon — try to get 4 corners
+    peri = cv2.arcLength(contour, True)
+    approx = None
+    
+    # Try different epsilon values to find exactly 4 corners
+    for eps_mult in [0.02, 0.03, 0.04, 0.05, 0.01]:
+        candidate = cv2.approxPolyDP(contour, eps_mult * peri, True)
+        if len(candidate) == 4:
+            approx = candidate
+            break
+    
+    if approx is None or len(approx) != 4:
+        # Fallback: use the minimum area rotated rectangle
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        approx = box.reshape(4, 1, 2).astype(np.float32)
+        logger.info("Perspective: using minAreaRect fallback")
+    
+    # Get the 4 source corners, ordered consistently
+    src_pts = approx.reshape(4, 2).astype(np.float32)
+    src_pts = order_corners(src_pts)
+    
+    # Calculate target dimensions from the source corners
+    # Width: max of top edge and bottom edge
+    width_top = np.linalg.norm(src_pts[1] - src_pts[0])
+    width_bot = np.linalg.norm(src_pts[2] - src_pts[3])
+    target_w = int(max(width_top, width_bot)) + 2 * padding
+    
+    # Height: max of left edge and right edge
+    height_left = np.linalg.norm(src_pts[3] - src_pts[0])
+    height_right = np.linalg.norm(src_pts[2] - src_pts[1])
+    target_h = int(max(height_left, height_right)) + 2 * padding
+    
+    # Target rectangle with padding
+    dst_pts = np.array([
+        [padding, padding],
+        [target_w - padding - 1, padding],
+        [target_w - padding - 1, target_h - padding - 1],
+        [padding, target_h - padding - 1],
+    ], dtype=np.float32)
+    
+    # Compute perspective transform
+    matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    
+    # Warp the image
+    img_np = np.array(image)
+    if image.mode == "RGBA":
+        # Warp with transparent background
+        warped = cv2.warpPerspective(
+            img_np, matrix, (target_w, target_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0, 0),
+        )
+        corrected_image = Image.fromarray(warped, "RGBA")
+    else:
+        warped = cv2.warpPerspective(
+            img_np, matrix, (target_w, target_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+        corrected_image = Image.fromarray(warped, "RGB")
+    
+    # Warp the mask too
+    warped_mask = cv2.warpPerspective(
+        mask_np, matrix, (target_w, target_h),
+        flags=cv2.INTER_LANCZOS4,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    corrected_mask = Image.fromarray(warped_mask, "L")
+    
+    logger.info(
+        "Perspective corrected: %dx%d → %dx%d",
+        image.width, image.height, target_w, target_h,
+    )
+    return corrected_image, corrected_mask
+
+
 def run_sam3_segmentation(
     image: Image.Image,
     prompt: str,
@@ -240,7 +363,6 @@ def run_sam3_segmentation(
     if USE_AUTOCAST:
         ctx = torch.autocast("cuda", dtype=torch.bfloat16)
     else:
-        from contextlib import nullcontext
         ctx = nullcontext()
 
     with ctx:
@@ -342,7 +464,8 @@ def handler(job: dict) -> dict:
         "background": "Alpha",                 // "Alpha" or "Color"
         "bg_color": "#222222",                 // background color
         "invert": false,                       // invert mask
-        "auto_rotate": true                    // portrait → landscape
+        "auto_rotate": true,                   // portrait → landscape
+        "perspective_correct": false            // straighten skewed postcards
     }
     """
     try:
@@ -365,6 +488,7 @@ def handler(job: dict) -> dict:
         bg_color = inp.get("bg_color", "#222222")
         invert = bool(inp.get("invert", False))
         auto_rotate = bool(inp.get("auto_rotate", True))
+        do_perspective = bool(inp.get("perspective_correct", False))
 
         logger.info(
             "Job: prompt='%s' thresh=%.2f max_seg=%d blur=%d offset=%d mode=%s bg=%s",
@@ -403,6 +527,14 @@ def handler(job: dict) -> dict:
                 "error": f"SAM3 found no objects for prompt: '{prompt}'",
             }
 
+        # --- Step 5b: Perspective correction (optional) ---
+        perspective_applied = False
+        if do_perspective:
+            result_image, mask_image = perspective_correct(
+                result_image, mask_image, padding=bbox_padding,
+            )
+            perspective_applied = True
+
         # --- Step 6: Crop to bounding box ---
         crop_bbox = compute_bounding_box(mask_image, padding=bbox_padding)
         result_image = result_image.crop(crop_bbox)
@@ -421,6 +553,7 @@ def handler(job: dict) -> dict:
             "height": result_image.height,
             "num_instances": num_found,
             "rotated": rotated,
+            "perspective_corrected": perspective_applied,
             "processing_time_s": round(elapsed, 2),
         }
 
