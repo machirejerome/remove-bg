@@ -152,10 +152,47 @@ def ensure_landscape(image: Image.Image) -> Image.Image:
     return image
 
 
+def fill_mask_holes(mask_image: Image.Image, kernel_size: int = 15) -> Image.Image:
+    """
+    Fill enclosed holes in a binary mask using morphological closing + flood-fill.
+
+    Steps:
+      1. Morphological closing — bridges small gaps in the mask boundary
+      2. Flood-fill from (0,0) — finds the background region
+      3. Invert the flood-fill — gives us the holes
+      4. OR with original — fills the holes while keeping the mask
+    """
+    mask_np = np.array(mask_image)
+
+    # 1. Morphological closing (closes small gaps in the boundary)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
+
+    # 2. Flood-fill from top-left corner (assumes corner is background)
+    h, w = closed.shape
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    filled = closed.copy()
+    cv2.floodFill(filled, flood_mask, (0, 0), 255)
+
+    # 3. Invert: the unfilled regions are the holes
+    filled_inv = cv2.bitwise_not(filled)
+
+    # 4. Combine: original mask + filled holes
+    result = cv2.bitwise_or(closed, filled_inv)
+
+    pixels_filled = int(np.sum(result > 0) - np.sum(mask_np > 0))
+    if pixels_filled > 0:
+        logger.info("Hole-fill: kernel=%d, pixels filled=%d", kernel_size, pixels_filled)
+    return Image.fromarray(result, mode="L")
+
+
 def process_mask(mask_image: Image.Image, invert=False, blur=0, offset=0) -> Image.Image:
     """
-    Post-process mask — exact port from comfyui-rmbg process_mask().
+    Post-process mask — extended with automatic hole-filling.
+    Order: fill holes → invert → blur → offset
     """
+    # Always fill holes internally (no API change needed)
+    mask_image = fill_mask_holes(mask_image)
     if invert:
         mask_np = np.array(mask_image)
         mask_image = Image.fromarray(255 - mask_np)
