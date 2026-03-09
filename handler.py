@@ -186,13 +186,59 @@ def fill_mask_holes(mask_image: Image.Image, kernel_size: int = 15) -> Image.Ima
     return Image.fromarray(result, mode="L")
 
 
-def process_mask(mask_image: Image.Image, invert=False, blur=0, offset=0) -> Image.Image:
+def fill_mask_convex_hull(mask_image: Image.Image) -> Image.Image:
     """
-    Post-process mask — extended with automatic hole-filling.
+    Fill the mask by computing the convex hull of all contours and filling it.
+
+    This guarantees that EVERYTHING inside the postcard boundary is included
+    in the mask — no internal holes possible (barcode, bright spots, etc.).
+
+    Steps:
+      1. Find all external contours of the SAM3 mask
+      2. Merge all contour points
+      3. Compute convex hull of the merged points
+      4. Fill the hull completely white → lückenlose Maske
+
+    Falls back to fill_mask_holes() if no contours are found.
+    """
+    mask_np = np.array(mask_image)
+
+    # Find external contours
+    contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        logger.warning("Convex hull fill: no contours found, falling back to flood-fill")
+        return fill_mask_holes(mask_image)
+
+    # Merge all contour points into one set
+    all_points = np.vstack(contours)
+
+    # Compute convex hull
+    hull = cv2.convexHull(all_points)
+
+    # Create a completely filled mask from the hull
+    result = np.zeros_like(mask_np)
+    cv2.fillConvexPoly(result, hull.squeeze(), 255)
+
+    pixels_filled = int(np.sum(result > 0) - np.sum(mask_np > 0))
+    logger.info("Convex hull fill: contours=%d, hull_points=%d, pixels_added=%d",
+                len(contours), len(hull), pixels_filled)
+    return Image.fromarray(result, mode="L")
+
+
+def process_mask(mask_image: Image.Image, invert=False, blur=0, offset=0,
+                 fill_mode="convex_hull") -> Image.Image:
+    """
+    Post-process mask — with selectable hole-filling method.
     Order: fill holes → invert → blur → offset
+
+    fill_mode:
+      - "convex_hull": fills entire convex hull (no internal holes possible)
+      - "flood_fill": legacy flood-fill method
     """
-    # Always fill holes internally (no API change needed)
-    mask_image = fill_mask_holes(mask_image)
+    if fill_mode == "convex_hull":
+        mask_image = fill_mask_convex_hull(mask_image)
+    else:
+        mask_image = fill_mask_holes(mask_image)
     if invert:
         mask_np = np.array(mask_image)
         mask_image = Image.fromarray(255 - mask_np)
@@ -376,6 +422,7 @@ def run_sam3_segmentation(
     background: str,
     background_color: str,
     output_mode: str,
+    fill_mode: str = "convex_hull",
 ) -> tuple:
     """
     Run SAM3 segmentation — exact port from comfyui-rmbg _run_single_merged / _run_single_per_instance.
@@ -447,7 +494,7 @@ def run_sam3_segmentation(
         merged = masks.amax(dim=0)
         mask_np = (merged.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         mask_image = Image.fromarray(mask_np, mode="L")
-        mask_image = process_mask(mask_image, invert, mask_blur, mask_offset)
+        mask_image = process_mask(mask_image, invert, mask_blur, mask_offset, fill_mode=fill_mode)
         result_image = apply_background_color(image, mask_image, background, background_color)
         if background == "Alpha":
             result_image = result_image.convert("RGBA")
@@ -459,7 +506,7 @@ def run_sam3_segmentation(
         single_mask = masks[0]
         mask_np = (single_mask.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
         mask_image = Image.fromarray(mask_np, mode="L")
-        mask_image = process_mask(mask_image, invert, mask_blur, mask_offset)
+        mask_image = process_mask(mask_image, invert, mask_blur, mask_offset, fill_mode=fill_mode)
         result_image = apply_background_color(image, mask_image, background, background_color)
         if background == "Alpha":
             result_image = result_image.convert("RGBA")
@@ -491,7 +538,8 @@ def handler(job: dict) -> dict:
         "bg_color": "#222222",                 // background color
         "invert": false,                       // invert mask
         "auto_rotate": true,                   // portrait → landscape
-        "perspective_correct": false            // straighten skewed postcards
+        "perspective_correct": false,           // straighten skewed postcards
+        "mask_fill_mode": "convex_hull"          // "convex_hull" or "flood_fill"
     }
     """
     try:
@@ -515,10 +563,14 @@ def handler(job: dict) -> dict:
         invert = bool(inp.get("invert", False))
         auto_rotate = bool(inp.get("auto_rotate", True))
         do_perspective = bool(inp.get("perspective_correct", False))
+        fill_mode = inp.get("mask_fill_mode", "convex_hull")
+        if fill_mode not in ("convex_hull", "flood_fill"):
+            logger.warning("Unknown mask_fill_mode='%s', using 'convex_hull'", fill_mode)
+            fill_mode = "convex_hull"
 
         logger.info(
-            "Job: prompt='%s' thresh=%.2f max_seg=%d blur=%d offset=%d mode=%s bg=%s",
-            prompt, threshold, max_segments, mask_blur, mask_offset, output_mode, background,
+            "Job: prompt='%s' thresh=%.2f max_seg=%d blur=%d offset=%d mode=%s bg=%s fill=%s",
+            prompt, threshold, max_segments, mask_blur, mask_offset, output_mode, background, fill_mode,
         )
         t_start = time.time()
 
@@ -545,6 +597,7 @@ def handler(job: dict) -> dict:
             background=background,
             background_color=bg_color,
             output_mode=output_mode,
+            fill_mode=fill_mode,
         )
 
         if result_image is None:
